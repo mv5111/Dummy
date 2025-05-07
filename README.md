@@ -1,170 +1,278 @@
 import os
 import cv2
-import json
+import faiss
 import yaml
-import datetime
+import json
+import base64
+import numpy as np
 from PIL import Image
-from io import BytesIO
-from dataclasses import dataclass
-from typing import List, Dict
+from datetime import datetime
+from typing import List, Dict, Tuple
 from huggingface_hub import InferenceClient
+from transformers import AutoProcessor, AutoTokenizer, AutoModelForVision2Seq
 
+# ====================
+# Configuration Loader
+# ====================
 
-@dataclass
-class Scene:
-    id: str
-    screen_type: str
-    screenshot: str
-    duration: float
-    section: str
-    structure: List[Dict]
-    embeddings: str
-    text_elements: List[str]
-    actions: List[str]
+class WorkflowCreatorConfig:
+    def __init__(self, config_path: str):
+        with open(config_path, 'r') as f:
+            config = yaml.safe_load(f)
 
+        self.video_path = os.path.join(os.path.dirname(config_path), config["video_source"])
+        self.output_path = os.path.join(os.path.dirname(config_path), config["output_json"])
+        self.frame_interval = config.get("frame_interval", 30)
+        self.min_confidence = config.get("min_confidence", 0.8)
+        self.models = config["models"]
+        self.faiss_config = config.get("faiss", {})
+        self.screenshot_dir = os.path.join(os.path.dirname(config_path), config.get("screenshot_dir", "screenshots"))
 
-class VideoProcessor:
-    def __init__(self, video_path, scene_interval=5):
-        self.video_path = video_path
-        self.scene_interval = scene_interval  # seconds
+        os.makedirs(self.screenshot_dir, exist_ok=True)
 
-    def extract_scenes(self, output_folder):
-        cap = cv2.VideoCapture(self.video_path)
-        fps = cap.get(cv2.CAP_PROP_FPS)
-        frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        duration = frame_count / fps
-
-        os.makedirs(output_folder, exist_ok=True)
-
-        scenes = []
-        for t in range(0, int(duration), self.scene_interval):
-            cap.set(cv2.CAP_PROP_POS_MSEC, t * 1000)
-            ret, frame = cap.read()
-            if not ret:
-                break
-            image = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-            filename = os.path.join(output_folder, f"scene_{len(scenes)+1}.png")
-            image.save(filename)
-            scenes.append({
-                "id": f"scene_{len(scenes)+1}",
-                "image_path": filename,
-                "duration": self.scene_interval
-            })
-
-        cap.release()
-        return scenes
-
-
-class FrameAnalyzer:
-    def __init__(self, model_name="Qwen/Qwen-VL"):
-        self.client = InferenceClient(model=model_name)
-
-    def analyze_frame(self, frame: Image.Image):
-        buffer = BytesIO()
-        frame.save(buffer, format="PNG")
-        buffer.seek(0)
-
-        prompt = "Describe the scene in detail and list all the user actions in the UI."
-        response = self.client.image_to_text(image=buffer, prompt=prompt)
-        return response
-
+# ====================
+# Image Embedding & FAISS
+# ====================
 
 class ImageVectorStore:
-    def __init__(self, model_name="openai/clip-vit-base-patch32"):
-        self.model = InferenceClient(model=model_name)
+    def __init__(self, config: WorkflowCreatorConfig):
+        self.index = None
+        self.embeddings = {}
+        self.model = InferenceClient(config.models["embedding"])
+        self.dimension = 384  # Dimension for 'all-MiniLM-L6-v2'
+        self.similarity_threshold = config.faiss_config.get("similarity_threshold", 0.85)
 
-    def _get_embedding(self, image: Image.Image):
-        buffer = BytesIO()
-        image.save(buffer, format="PNG")
-        buffer.seek(0)
-        response = self.model.feature_extraction(buffer)
-        return response
+    def initialize_index(self):
+        self.index = faiss.IndexFlatL2(self.dimension)
 
+    def add_embedding(self, image: Image.Image, scene_id: str):
+        embedding = self._get_embedding(image)
+        if self.index is None:
+            self.initialize_index()
 
-def generate_json(video_path, scene_data, output_path, config):
-    output = {
-        "workflow": {
-            "metadata": {
-                "created_at": datetime.datetime.now().isoformat(),
-                "video_source": os.path.basename(video_path),
-                "config": config
-            },
-            "scenes": [],
-            "statistics": {
-                "total_scenes": len(scene_data),
-                "unique_screens": len(scene_data)
-            },
-            "completion": True
+        self.embeddings[scene_id] = embedding
+        self.index.add(np.array([embedding]).astype('float32'))
+
+    def find_similar(self, image: Image.Image) -> Tuple[str, float]:
+        if self.index is None or len(self.embeddings) == 0:
+            return None, 0.0
+
+        query_embed = self._get_embedding(image)
+        distances, indices = self.index.search(np.array([query_embed]).astype('float32'), 1)
+
+        if indices[0][0] == -1:
+            return None, 0.0
+
+        scene_id = list(self.embeddings.keys())[indices[0][0]]
+        similarity = 1 - (distances[0][0] / self.dimension)
+        return (scene_id, similarity) if similarity > self.similarity_threshold else (None, 0.0)
+
+    def _get_embedding(self, image: Image.Image) -> List[float]:
+        image = image.convert("RGB")
+        buffered = BytesIO()
+        image.save(buffered, format="PNG")
+        img_str = base64.b64encode(buffered.getvalue()).decode("utf-8")
+        response = self.model.feature_extraction(images=[img_str])
+        return response[0]
+
+# ====================
+# Frame Analysis
+# ====================
+
+class FrameAnalyzer:
+    def __init__(self, config: WorkflowCreatorConfig):
+        self.model_name = config.models["screen_analysis"]
+        self.processor = AutoProcessor.from_pretrained(self.model_name)
+        self.tokenizer = AutoTokenizer.from_pretrained(self.model_name)
+        self.model = AutoModelForVision2Seq.from_pretrained(self.model_name)
+
+    def analyze_frame(self, frame: Image.Image) -> Dict:
+        try:
+            inputs = self.processor(images=frame, return_tensors="pt")
+            outputs = self.model.generate(**inputs)
+            description = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
+            analysis = json.loads(description)
+            return self._validate_analysis(analysis)
+        except Exception as e:
+            print(f"Analysis error: {e}")
+            return self._create_empty_analysis()
+
+    def _validate_analysis(self, analysis: Dict) -> Dict:
+        required_sections = ["metadata", "structure", "components"]
+        return analysis if all(section in analysis for section in required_sections) else self._create_empty_analysis()
+
+    def _create_empty_analysis(self) -> Dict:
+        return {
+            "metadata": {"screen_type": "unknown"},
+            "structure": [],
+            "components": [],
+            "text_elements": [],
+            "visual_hierarchy": []
         }
-    }
 
-    for scene in scene_data:
-        output["workflow"]["scenes"].append({
-            "id": scene.id,
-            "screen_type": scene.screen_type,
-            "screenshot": scene.screenshot,
-            "duration": scene.duration,
-            "section": scene.section,
-            "structure": scene.structure,
-            "embeddings": scene.embeddings,
-            "text_elements": scene.text_elements,
-            "actions": scene.actions
-        })
+# ====================
+# Scene Management
+# ====================
 
-    with open(output_path, "w") as f:
-        json.dump(output, f, indent=4)
+class SceneManager:
+    def __init__(self, vector_store: ImageVectorStore, config: WorkflowCreatorConfig):
+        self.vector_store = vector_store
+        self.config = config
+        self.scenes = []
+        self.current_scene = None
+        self.initial_scene_id = None
 
+    def detect_scene_change(self, frame: Image.Image) -> bool:
+        if not self.current_scene:
+            return True
 
-def main(config_path):
-    with open(config_path, 'r') as f:
-        config = yaml.safe_load(f)
+        scene_id, similarity = self.vector_store.find_similar(frame)
+        return scene_id != self.current_scene['scene_id']
 
-    video_path = config["video_path"]
-    scene_output_dir = config["scene_output_dir"]
-    output_json_path = config["output_json_path"]
+    def create_new_scene(self, frame: Image.Image, analysis: Dict):
+        scene_id = f"scene_{len(self.scenes)+1}"
+        self.vector_store.add_embedding(frame, scene_id)
 
-    video_processor = VideoProcessor(video_path)
-    frame_analyzer = FrameAnalyzer()
-    vector_store = ImageVectorStore()
+        self.current_scene = {
+            "scene_id": scene_id,
+            "screenshot": self._store_screenshot(frame, scene_id),
+            "start_time": datetime.now().isoformat(),
+            "end_time": None,
+            "analysis": analysis,
+            "actions": []
+        }
 
-    scene_infos = video_processor.extract_scenes(scene_output_dir)
-    scene_objects = []
+        if not self.initial_scene_id:
+            self.initial_scene_id = scene_id
 
-    for info in scene_infos:
-        image = Image.open(info["image_path"])
-        description = frame_analyzer.analyze_frame(image)
-        embedding = vector_store._get_embedding(image)
+        self.scenes.append(self.current_scene)
 
-        # Dummy structure based on description
-        structure = [{
-            "position": [100, 200, 150, 225],
-            "components": [{
-                "type": "button",
-                "position": [100, 200, 150, 225],
-                "text": "Save",
-                "properties": {
-                    "color": "#4287f5",
-                    "font": "Arial 12pt"
-                },
-                "actions": ["click"]
-            }]
-        }]
+    def finalize_scene(self):
+        if self.current_scene:
+            self.current_scene['end_time'] = datetime.now().isoformat()
 
-        scene_objects.append(Scene(
-            id=info["id"],
-            screen_type="dashboard",
-            screenshot=info["image_path"],
-            duration=info["duration"],
-            section="main_menu",
-            structure=structure,
-            embeddings="faiss_index.bin",
-            text_elements=[description],
-            actions=["click"]
-        ))
+    def check_completion(self, frame: Image.Image) -> bool:
+        if not self.initial_scene_id:
+            return False
 
-    generate_json(video_path, scene_objects, output_json_path, config)
+        scene_id, similarity = self.vector_store.find_similar(frame)
+        return scene_id == self.initial_scene_id and len(self.scenes) > 1
 
+    def _store_screenshot(self, frame: Image.Image, scene_id: str) -> str:
+        path = os.path.join(self.config.screenshot_dir, f"{scene_id}.png")
+        frame.save(path)
+        return path
+
+# ====================
+# Video Processing
+# ====================
+
+class VideoProcessor:
+    def __init__(self, config: WorkflowCreatorConfig):
+        self.config = config
+        self.cap = cv2.VideoCapture(config.video_path)
+        self.vector_store = ImageVectorStore(config)
+        self.frame_analyzer = FrameAnalyzer(config)
+        self.scene_manager = SceneManager(self.vector_store, config)
+        self.frame_count = 0
+
+    def process_video(self) -> Dict:
+        workflow = {
+            "metadata": self._create_metadata(),
+            "scenes": [],
+            "embeddings_index": "faiss_index.bin",
+            "completed": False
+        }
+
+        while self.cap.isOpened():
+            ret, frame = self.cap.read()
+            if not ret:
+                break
+
+            if self.frame_count % self.config.frame_interval == 0:
+                pil_image = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+                analysis = self.frame_analyzer.analyze_frame(pil_image)
+
+                if self.scene_manager.detect_scene_change(pil_image):
+                    self.scene_manager.finalize_scene()
+                    self.scene_manager.create_new_scene(pil_image, analysis)
+                else:
+                    self._update_current_scene()
+
+                if self.scene_manager.check_completion(pil_image):
+                    workflow['completed'] = True
+                    break
+
+            self.frame_count += 1
+
+        self._finalize_processing(workflow)
+        return workflow
+
+    def _update_current_scene(self):
+        # Placeholder for action tracking logic
+        pass
+
+    def _finalize_processing(self, workflow: Dict):
+        self.cap.release()
+        faiss.write_index(self.vector_store.index, "faiss_index.bin")
+        workflow['scenes'] = [s.copy() for s in self.scene_manager.scenes]
+
+    def _create_metadata(self) -> Dict:
+        return {
+            "created_at": datetime.now().isoformat(),
+            "video_source": self.config.video_path,
+            "config": vars(self.config)
+        }
+
+# ====================
+# Workflow Generation
+# ====================
+
+class WorkflowGenerator:
+    def generate(self, processed_data: Dict) -> Dict:
+        return {
+            "workflow": {
+                "metadata": processed_data["metadata"],
+                "scenes": self._process_scenes(processed_data["scenes"]),
+                "embeddings": processed_data["embeddings_index"],
+                "completion": processed_data["completed"]
+            },
+            "statistics": {
+                "total_scenes": len(processed_data["scenes"]),
+                "unique_screens": len({s['scene_id'] for s in processed_data["scenes"]})
+            }
+        }
+
+    def _process_scenes(self, scenes: List) -> List:
+        return [{
+            "id": s["scene_id"],
+            "screen_type": s["analysis"]["metadata"]["screen_type"],
+            "duration": self._calculate_duration(s["start_time"], s["end_time"]),
+            "screenshot": s["screenshot"],
+            "structure": s["analysis"]["structure"],
+            "components": self._format_components(s["analysis"]["components"]),
+            "text_elements": s["analysis"]["text_elements"],
+            "actions": s["actions"]
+        } for s in scenes
+::contentReference[oaicite:0]{index=0}
+ 
+import sys
+from io import BytesIO
+
+def main():
+    config_path = os.path.join("workflow creation", "config.yaml")
+    config = WorkflowCreatorConfig(config_path)
+
+    processor = VideoProcessor(config)
+    processed_data = processor.process_video()
+
+    generator = WorkflowGenerator()
+    workflow_output = generator.generate(processed_data)
+
+    with open(config.output_path, 'w') as f:
+        json.dump(workflow_output, f, indent=4)
+
+    print(f"Workflow JSON saved to {config.output_path}")
 
 if __name__ == "__main__":
-    config_path = "/Workspace/Users/mrinalini.vettri@fisglobal.com/video_analysis/workflow creation/config.yaml"
-    main(config_path)
+    main()
