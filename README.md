@@ -1,278 +1,144 @@
+%pip install opencv-python ultralytics
 import os
-import cv2
-import faiss
 import yaml
-import json
-import base64
+import torch
+import cv2
 import numpy as np
-from PIL import Image
-from datetime import datetime
-from typing import List, Dict, Tuple
-from huggingface_hub import InferenceClient
-from transformers import AutoProcessor, AutoTokenizer, AutoModelForVision2Seq
+from PIL import Image, ImageDraw
+from ultralytics import YOLO
+import pytesseract
+import xml.etree.ElementTree as ET
+import shutil
 
-# ====================
-# Configuration Loader
-# ====================
+class ChequeProcessor:
+    def __init__(self, xml_path, images_dir, output_dir):
+        self.xml_path = xml_path
+        self.images_dir = images_dir
+        self.output_dir = output_dir
+        self.main_classes = ['dollar_amount_section', 'legal_amount_section', 'date_section']
+        os.makedirs(os.path.expanduser(output_dir), exist_ok=True)
 
-class WorkflowCreatorConfig:
-    def __init__(self, config_path: str):
-        with open(config_path, 'r') as f:
-            config = yaml.safe_load(f)
+    def xml_to_yolo_stage1(self):
+        tree = ET.parse(self.xml_path)
+        root = tree.getroot()
 
-        self.video_path = os.path.join(os.path.dirname(config_path), config["video_source"])
-        self.output_path = os.path.join(os.path.dirname(config_path), config["output_json"])
-        self.frame_interval = config.get("frame_interval", 30)
-        self.min_confidence = config.get("min_confidence", 0.8)
-        self.models = config["models"]
-        self.faiss_config = config.get("faiss", {})
-        self.screenshot_dir = os.path.join(os.path.dirname(config_path), config.get("screenshot_dir", "screenshots"))
+        main_class_map = {cls: idx for idx, cls in enumerate(self.main_classes)}
+        
+        # Output folders
+        train_img_dir = os.path.join(self.output_dir, 'stage1', 'images', 'train')
+        val_img_dir = os.path.join(self.output_dir, 'stage1', 'images', 'val')
+        train_label_dir = os.path.join(self.output_dir, 'stage1', 'labels', 'train')
+        val_label_dir = os.path.join(self.output_dir, 'stage1', 'labels', 'val')
+        os.makedirs(train_img_dir, exist_ok=True)
+        os.makedirs(val_img_dir, exist_ok=True)
+        os.makedirs(train_label_dir, exist_ok=True)
+        os.makedirs(val_label_dir, exist_ok=True)
 
-        os.makedirs(self.screenshot_dir, exist_ok=True)
+        images_processed = 0
+        for image in root.findall('image'):
+            img_file = image.get('file')
+            if img_file is None:
+                continue
+            img_path = os.path.join(self.images_dir, img_file)
+            if not os.path.exists(img_path):
+                continue
 
-# ====================
-# Image Embedding & FAISS
-# ====================
+            img_width = int(image.get('width'))
+            img_height = int(image.get('height'))
 
-class ImageVectorStore:
-    def __init__(self, config: WorkflowCreatorConfig):
-        self.index = None
-        self.embeddings = {}
-        self.model = InferenceClient(config.models["embedding"])
-        self.dimension = 384  # Dimension for 'all-MiniLM-L6-v2'
-        self.similarity_threshold = config.faiss_config.get("similarity_threshold", 0.85)
+            if np.random.rand() < 0.8:
+                img_dest = os.path.join(train_img_dir, img_file)
+                label_dest = os.path.join(train_label_dir, f"{os.path.splitext(img_file)[0]}.txt")
+            else:
+                img_dest = os.path.join(val_img_dir, img_file)
+                label_dest = os.path.join(val_label_dir, f"{os.path.splitext(img_file)[0]}.txt")
 
-    def initialize_index(self):
-        self.index = faiss.IndexFlatL2(self.dimension)
+            shutil.copy(img_path, img_dest)
 
-    def add_embedding(self, image: Image.Image, scene_id: str):
-        embedding = self._get_embedding(image)
-        if self.index is None:
-            self.initialize_index()
+            with open(label_dest, 'w') as lf:
+                for box in image.findall('box'):
+                    label = box.get('label')
+                    if label in self.main_classes:
+                        x_min = float(box.get('xtl'))
+                        y_min = float(box.get('ytl'))
+                        x_max = float(box.get('xbr'))
+                        y_max = float(box.get('ybr'))
+                        x_center = (x_min + x_max) / 2 / img_width
+                        y_center = (y_min + y_max) / 2 / img_height
+                        width = (x_max - x_min) / img_width
+                        height = (y_max - y_min) / img_height
+                        class_id = main_class_map[label]
+                        lf.write(f"{class_id} {x_center} {y_center} {width} {height}\n")
+            images_processed += 1
+        
+        print(f"Total images processed: {images_processed}")
 
-        self.embeddings[scene_id] = embedding
-        self.index.add(np.array([embedding]).astype('float32'))
-
-    def find_similar(self, image: Image.Image) -> Tuple[str, float]:
-        if self.index is None or len(self.embeddings) == 0:
-            return None, 0.0
-
-        query_embed = self._get_embedding(image)
-        distances, indices = self.index.search(np.array([query_embed]).astype('float32'), 1)
-
-        if indices[0][0] == -1:
-            return None, 0.0
-
-        scene_id = list(self.embeddings.keys())[indices[0][0]]
-        similarity = 1 - (distances[0][0] / self.dimension)
-        return (scene_id, similarity) if similarity > self.similarity_threshold else (None, 0.0)
-
-    def _get_embedding(self, image: Image.Image) -> List[float]:
-        image = image.convert("RGB")
-        buffered = BytesIO()
-        image.save(buffered, format="PNG")
-        img_str = base64.b64encode(buffered.getvalue()).decode("utf-8")
-        response = self.model.feature_extraction(images=[img_str])
-        return response[0]
-
-# ====================
-# Frame Analysis
-# ====================
-
-class FrameAnalyzer:
-    def __init__(self, config: WorkflowCreatorConfig):
-        self.model_name = config.models["screen_analysis"]
-        self.processor = AutoProcessor.from_pretrained(self.model_name)
-        self.tokenizer = AutoTokenizer.from_pretrained(self.model_name)
-        self.model = AutoModelForVision2Seq.from_pretrained(self.model_name)
-
-    def analyze_frame(self, frame: Image.Image) -> Dict:
-        try:
-            inputs = self.processor(images=frame, return_tensors="pt")
-            outputs = self.model.generate(**inputs)
-            description = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
-            analysis = json.loads(description)
-            return self._validate_analysis(analysis)
-        except Exception as e:
-            print(f"Analysis error: {e}")
-            return self._create_empty_analysis()
-
-    def _validate_analysis(self, analysis: Dict) -> Dict:
-        required_sections = ["metadata", "structure", "components"]
-        return analysis if all(section in analysis for section in required_sections) else self._create_empty_analysis()
-
-    def _create_empty_analysis(self) -> Dict:
-        return {
-            "metadata": {"screen_type": "unknown"},
-            "structure": [],
-            "components": [],
-            "text_elements": [],
-            "visual_hierarchy": []
+    def create_yolo_configs(self):
+        stage1_config = {
+            'path': os.path.join(self.output_dir, 'stage1'),
+            'train': 'images/train',
+            'val': 'images/val',
+            'nc': len(self.main_classes),
+            'names': self.main_classes
         }
+        with open(os.path.join(self.output_dir, 'stage1_config.yaml'), 'w') as f:
+            yaml.dump(stage1_config, f)
 
-# ====================
-# Scene Management
-# ====================
+class ChequeTrainingPipeline:
+    def __init__(self, processor):
+        self.processor = processor
+        self.stage1_model = None
 
-class SceneManager:
-    def __init__(self, vector_store: ImageVectorStore, config: WorkflowCreatorConfig):
-        self.vector_store = vector_store
-        self.config = config
-        self.scenes = []
-        self.current_scene = None
-        self.initial_scene_id = None
+    def train_stage1(self, epochs=50, batch_size=8):
+        config_path = os.path.join(self.processor.output_dir, 'stage1_config.yaml')
+        model = YOLO('yolov8s.pt')
+        results = model.train(
+            data=config_path,
+            epochs=epochs,
+            batch=batch_size,
+            imgsz=640,
+            device='cpu'  # Use 'cuda' if GPU available
+        )
+        self.stage1_model = model
+        return results
 
-    def detect_scene_change(self, frame: Image.Image) -> bool:
-        if not self.current_scene:
-            return True
+class ChequeInspector:
+    def __init__(self, stage1_model_path):
+        self.stage1_model = YOLO(stage1_model_path)
 
-        scene_id, similarity = self.vector_store.find_similar(frame)
-        return scene_id != self.current_scene['scene_id']
+    def predict_and_visualize(self, image_path, output_path='output_with_boxes.jpg'):
+        img = Image.open(image_path).convert("RGB")
+        result = self.stage1_model(image_path)[0]
 
-    def create_new_scene(self, frame: Image.Image, analysis: Dict):
-        scene_id = f"scene_{len(self.scenes)+1}"
-        self.vector_store.add_embedding(frame, scene_id)
+        draw = ImageDraw.Draw(img)
+        for box in result.boxes:
+            cls_id = int(box.cls)
+            bbox = box.xyxy[0].tolist()
+            class_name = self.stage1_model.names[cls_id]
+            conf = float(box.conf)
+            draw.rectangle(bbox, outline="red", width=2)
+            draw.text((bbox[0], bbox[1] - 10), f"{class_name} ({conf:.2f})", fill="yellow")
+        
+        img.save(output_path)
+        print(f"Saved visualization to {output_path}")
 
-        self.current_scene = {
-            "scene_id": scene_id,
-            "screenshot": self._store_screenshot(frame, scene_id),
-            "start_time": datetime.now().isoformat(),
-            "end_time": None,
-            "analysis": analysis,
-            "actions": []
-        }
-
-        if not self.initial_scene_id:
-            self.initial_scene_id = scene_id
-
-        self.scenes.append(self.current_scene)
-
-    def finalize_scene(self):
-        if self.current_scene:
-            self.current_scene['end_time'] = datetime.now().isoformat()
-
-    def check_completion(self, frame: Image.Image) -> bool:
-        if not self.initial_scene_id:
-            return False
-
-        scene_id, similarity = self.vector_store.find_similar(frame)
-        return scene_id == self.initial_scene_id and len(self.scenes) > 1
-
-    def _store_screenshot(self, frame: Image.Image, scene_id: str) -> str:
-        path = os.path.join(self.config.screenshot_dir, f"{scene_id}.png")
-        frame.save(path)
-        return path
-
-# ====================
-# Video Processing
-# ====================
-
-class VideoProcessor:
-    def __init__(self, config: WorkflowCreatorConfig):
-        self.config = config
-        self.cap = cv2.VideoCapture(config.video_path)
-        self.vector_store = ImageVectorStore(config)
-        self.frame_analyzer = FrameAnalyzer(config)
-        self.scene_manager = SceneManager(self.vector_store, config)
-        self.frame_count = 0
-
-    def process_video(self) -> Dict:
-        workflow = {
-            "metadata": self._create_metadata(),
-            "scenes": [],
-            "embeddings_index": "faiss_index.bin",
-            "completed": False
-        }
-
-        while self.cap.isOpened():
-            ret, frame = self.cap.read()
-            if not ret:
-                break
-
-            if self.frame_count % self.config.frame_interval == 0:
-                pil_image = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-                analysis = self.frame_analyzer.analyze_frame(pil_image)
-
-                if self.scene_manager.detect_scene_change(pil_image):
-                    self.scene_manager.finalize_scene()
-                    self.scene_manager.create_new_scene(pil_image, analysis)
-                else:
-                    self._update_current_scene()
-
-                if self.scene_manager.check_completion(pil_image):
-                    workflow['completed'] = True
-                    break
-
-            self.frame_count += 1
-
-        self._finalize_processing(workflow)
-        return workflow
-
-    def _update_current_scene(self):
-        # Placeholder for action tracking logic
-        pass
-
-    def _finalize_processing(self, workflow: Dict):
-        self.cap.release()
-        faiss.write_index(self.vector_store.index, "faiss_index.bin")
-        workflow['scenes'] = [s.copy() for s in self.scene_manager.scenes]
-
-    def _create_metadata(self) -> Dict:
-        return {
-            "created_at": datetime.now().isoformat(),
-            "video_source": self.config.video_path,
-            "config": vars(self.config)
-        }
-
-# ====================
-# Workflow Generation
-# ====================
-
-class WorkflowGenerator:
-    def generate(self, processed_data: Dict) -> Dict:
-        return {
-            "workflow": {
-                "metadata": processed_data["metadata"],
-                "scenes": self._process_scenes(processed_data["scenes"]),
-                "embeddings": processed_data["embeddings_index"],
-                "completion": processed_data["completed"]
-            },
-            "statistics": {
-                "total_scenes": len(processed_data["scenes"]),
-                "unique_screens": len({s['scene_id'] for s in processed_data["scenes"]})
-            }
-        }
-
-    def _process_scenes(self, scenes: List) -> List:
-        return [{
-            "id": s["scene_id"],
-            "screen_type": s["analysis"]["metadata"]["screen_type"],
-            "duration": self._calculate_duration(s["start_time"], s["end_time"]),
-            "screenshot": s["screenshot"],
-            "structure": s["analysis"]["structure"],
-            "components": self._format_components(s["analysis"]["components"]),
-            "text_elements": s["analysis"]["text_elements"],
-            "actions": s["actions"]
-        } for s in scenes
-::contentReference[oaicite:0]{index=0}
- 
-import sys
-from io import BytesIO
-
-def main():
-    config_path = os.path.join("workflow creation", "config.yaml")
-    config = WorkflowCreatorConfig(config_path)
-
-    processor = VideoProcessor(config)
-    processed_data = processor.process_video()
-
-    generator = WorkflowGenerator()
-    workflow_output = generator.generate(processed_data)
-
-    with open(config.output_path, 'w') as f:
-        json.dump(workflow_output, f, indent=4)
-
-    print(f"Workflow JSON saved to {config.output_path}")
-
+# Usage Example
 if __name__ == "__main__":
-    main()
+    # Paths
+    images_dir = "/Workspace/Users/mrinalini.vettri@fisglobal.com/yolo_check_training/checks"
+    annotations_path = "annotations.xml"
+    output_dir = "checks"
+
+    # Step 1: Prepare data
+    processor = ChequeProcessor(annotations_path, images_dir, output_dir)
+    processor.xml_to_yolo_stage1()
+    processor.create_yolo_configs()
+
+    # Step 2: Train stage 1
+    pipeline = ChequeTrainingPipeline(processor)
+    stage1_results = pipeline.train_stage1(epochs=50)
+
+    # Step 3: Visualize prediction
+    inspector = ChequeInspector(stage1_model_path='checks/stage1/weights/best.pt')
+    test_image = os.path.join(images_dir, '3307435490.tif')  # Replace with any test image
+    inspector.predict_and_visualize(test_image, output_path='visualized_prediction.jpg')
