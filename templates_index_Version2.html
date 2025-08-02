@@ -1,0 +1,104 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Invoice Analyzer</title>
+    <style>
+        body { font-family: Arial, sans-serif; }
+        #results { margin-top: 24px; }
+    </style>
+</head>
+<body>
+    <h1>Invoice Sense</h1>
+    <div>
+        <input type="text" id="image-path" placeholder="Select folder..." readonly>
+        <button id="browse-button">Browse</button>
+        <button id="run-button">Run</button>
+    </div>
+    <div>
+        <label>
+            <input type="radio" name="extractOption" value="extract_all" checked> Extract All
+        </label>
+        <label>
+            <input type="radio" name="extractOption" value="extract_invoice_amount"> Extract Invoice Amount
+        </label>
+        <label>
+            <input type="radio" name="extractOption" value="extract_itemise"> Extract Itemise
+        </label>
+    </div>
+
+    <div id="results"></div>
+
+    <script>
+        document.getElementById('browse-button').onclick = async function() {
+            // Simple AJAX fetch for folders, you can make this a popup for a better UX
+            const res = await fetch('/list_images');
+            const data = await res.json();
+            if (data.status === 'success') {
+                const folder = prompt('Enter folder name:\n' + data.folders.join('\n'));
+                if (folder) document.getElementById('image-path').value = folder;
+            } else {
+                alert('Error fetching folders');
+            }
+        };
+
+        document.getElementById('run-button').onclick = async function() {
+            const inputPath = document.getElementById('image-path').value.trim();
+            const selectedOption = document.querySelector('input[name="extractOption"]:checked').value;
+            if (!inputPath) {
+                alert('Please select a folder');
+                return;
+            }
+            document.getElementById('results').textContent = "Processing...";
+
+            const body = {
+                input_path: inputPath,
+                extract_all: selectedOption === 'extract_all',
+                extract_invoice_amount: selectedOption === 'extract_invoice_amount',
+                extract_itemise: selectedOption === 'extract_itemise'
+            };
+
+            const res = await fetch('/invoice_run', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(body)
+            });
+            const data = await res.json();
+            if (!data.run_id) {
+                document.getElementById('results').textContent = 'Error: ' + (data.error || 'Unknown error');
+                return;
+            }
+            pollJobStatus(data.run_id);
+        };
+
+        function pollJobStatus(runId) {
+            const interval = setInterval(async () => {
+                const res = await fetch('/check_invoice_status', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ run_id: runId })
+                });
+                const data = await res.json();
+                if (data.status === 'Succeed') {
+                    clearInterval(interval);
+                    const result = data.result.result || data.result;
+                    let html = `<h3>Results</h3>
+                        <p>Invoices processed: <b>${result.processed_count || '-'}</b></p>
+                        <p>Average time per invoice: <b>${result.average_processing_time_per_invoice || '-'}</b></p>`;
+                    if (result.node_details) {
+                        html += '<h4>Per-node details:</h4><ul>';
+                        result.node_details.forEach(nd => {
+                            html += `<li><b>${nd.node}:</b> Avg time: ${nd.average_time}s, Invoices: ${nd.processed_count}</li>`;
+                        });
+                        html += '</ul>';
+                    }
+                    document.getElementById('results').innerHTML = html;
+                } else if (data.status === 'Not-Succeed' || data.status === 'Error') {
+                    clearInterval(interval);
+                    document.getElementById('results').textContent = "Error: " + data.result;
+                }
+            }, 3000);
+        }
+    </script>
+</body>
+</html>
