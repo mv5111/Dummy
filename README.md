@@ -1,1 +1,20 @@
-this has the cde for my langgraph. i will explain the workflow to you. once the user selects a folder from the interface, whose code is in the app.py and index.html. that folder must be run by the invoice analyer class. the invoice images consists of tabular data, non tabular data and non table text. these information are being extracted in the nodes of langgraph. and then whatever radio button they clicked before running the folder in the interface, only that corresponding node has to be executed. if they click extract all radio button, then extract_all node must be executed. it should extract all the information from the invoice image - tabular, non tabular and non table text. and then it should return the avg time taken to process one image, no of invoices processed. for each node, the avg time taken to process one image, no of invoices processed informatio has to be generated. make sure that the app.py and index.html codes are updated accordingly. give an if statement for which node to be executed and result.exit for all node results
+# 6. Workflow Invocation and Result Formatting
+
+initial_state = {
+    "input_path": input_path,
+    "extract_all": extract_all,
+    "extract_invoice_amount": extract_invoice_amount,
+    "extract_itemise": extract_itemise
+}
+final_state = invoice_workflow.invoke(initial_state)
+
+result_data = {
+    "processed_count": final_state['final_response']['processed_count'],
+    "average_processing_time_per_invoice": final_state['final_response']['average_processing_time_per_invoice'],
+    "node_details": final_state['final_response']['node_details']
+}
+
+try:
+    dbutils.notebook.exit(json.dumps({"status": "success", "result": result_data}))
+except Exception:
+    print(json.dumps({"status": "success", "result": result_data}))
