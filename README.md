@@ -10,11 +10,12 @@ def extract_all_node(state: dict) -> dict:
     batch_size = 5
     num_images = 10
 
+    # Only write individual invoice JSON files; do not write/read processing_stats.json
     process_images(image_folder, output_folder, batch_size, num_images)
     json_files = [
         os.path.join(output_folder, fname)
         for fname in os.listdir(output_folder)
-        if fname.endswith('.json') and fname != "processing_stats.json"
+        if fname.endswith('.json')
     ]
     tabular_count = invoice_count = itemise_count = 0
     all_data = []
@@ -49,6 +50,8 @@ def extract_all_node(state: dict) -> dict:
     state["node_details"] = node_details
     return state
 
+
+
 def extract_invoice_amount_node(state: dict) -> dict:
     import time
     import os
@@ -65,7 +68,7 @@ def extract_invoice_amount_node(state: dict) -> dict:
     json_files = [
         os.path.join(output_folder, fname)
         for fname in os.listdir(output_folder)
-        if fname.endswith('.json') and fname != "processing_stats.json"
+        if fname.endswith('.json')
     ]
 
     invoice_amounts = []
@@ -89,6 +92,7 @@ def extract_invoice_amount_node(state: dict) -> dict:
     state["average_time_per_invoice"] = round(total_time / count, 2) if count else 0
     return state
 
+
 def extract_itemize_node(state: dict) -> dict:
     import time
     import os
@@ -105,7 +109,7 @@ def extract_itemize_node(state: dict) -> dict:
     json_files = [
         os.path.join(output_folder, fname)
         for fname in os.listdir(output_folder)
-        if fname.endswith('.json') and fname != "processing_stats.json"
+        if fname.endswith('.json')
     ]
 
     itemized_data = []
